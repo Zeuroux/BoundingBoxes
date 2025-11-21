@@ -1,0 +1,13 @@
+{
+  "uuid": "f5a02c55-1420-4f6e-83dc-c1d0ce170d7b",
+  "plugin_name": "Bounding boxes",
+  "plugin_author": "Zeuroux",
+  "plugin_description": "My amazing plugin description that I forgot to change for some reason.",
+  "plugin_version": "1.0.0",
+  "game_version": "1.21.123",
+  "supported_game_version_ranges": [
+    "0.0.0-9.99.9"
+  ],
+  "runtime_version": 7,
+  "target_assembly": "BoundingBoxes.dll"
+}
