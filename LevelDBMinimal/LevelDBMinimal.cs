@@ -1,7 +1,9 @@
-﻿using OnixRuntime.Plugin;
+﻿using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Buffers;
 
 namespace BoundingBoxes {
     public unsafe partial class LevelDBMinimal : IDisposable {
@@ -17,15 +19,11 @@ namespace BoundingBoxes {
 
         public static void Unload() {
             IntPtr handle = LoadLibraryW("LevelDBMinimal.dll");
-            if (handle == IntPtr.Zero) {
-                int err = Marshal.GetLastWin32Error();
-                throw new Exception($"LoadLibrary failed with error {err}");
+            if (handle != IntPtr.Zero) {
+                FreeLibrary(handle);
+                FreeLibrary(handle);
             }
-
-            FreeLibrary(handle);
-            FreeLibrary(handle);
         }
-        #region PInvoke - Main DB
 
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
@@ -42,17 +40,17 @@ namespace BoundingBoxes {
 
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
-        [return: MarshalAs(UnmanagedType.I1)]
-        public static partial bool GetValue(
+        private static partial void BatchGetFlat(
             IntPtr db,
-            byte* key,
-            UIntPtr keyLen,
-            out byte* outVal,
-            out UIntPtr outLen);
-
-        #endregion
-
-        #region PInvoke - Log Session
+            byte* flatKeys,
+            int* keyOffsets,
+            int* keyLengths,
+            int count,
+            out byte* outDataBlock,
+            int* outDataOffsets,
+            int* outDataLengths,
+            byte* outFound
+        );
 
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
@@ -65,37 +63,34 @@ namespace BoundingBoxes {
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
         [return: MarshalAs(UnmanagedType.I1)]
-        public static partial bool GetValueFromSession(
-            IntPtr session,
-            byte* key,
-            UIntPtr keyLen,
-            out byte* outVal,
-            out UIntPtr outLen);
+        private static partial bool UpdateLogSession(IntPtr session, byte* logDir);
 
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
-        [return: MarshalAs(UnmanagedType.I1)]
-        private static partial bool UpdateLogSession(IntPtr session, byte* logDir);
-
-        #endregion
-
-        #region Utilities
+        private static partial void BatchGetSessionFlat(
+            IntPtr session,
+            byte* flatKeys,
+            int* keyOffsets,
+            int* keyLengths,
+            int count,
+            out byte* outDataBlock,
+            int* outDataOffsets,
+            int* outDataLengths,
+            byte* outFound
+        );
 
         [LibraryImport(Dll)]
         [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
         internal static partial void FreeBuffer(byte* buffer);
 
-        #endregion
-
-        #region Main DB Wrapper
-
         public IntPtr NativeHandle => _nativeDb;
 
         public LevelDBMinimal(string path) {
-            byte[] pathBytes = Encoding.UTF8.GetBytes(path + "\0");
-            fixed (byte* p = pathBytes) {
-                _nativeDb = OpenDB(p);
-            }
+            var utf8ByteCount = Encoding.UTF8.GetByteCount(path);
+            Span<byte> buffer = stackalloc byte[utf8ByteCount + 1];
+            Encoding.UTF8.GetBytes(path, buffer);
+            buffer[utf8ByteCount] = 0;
+            fixed (byte* p = buffer) { _nativeDb = OpenDB(p); }
         }
 
         public void Dispose() {
@@ -107,31 +102,81 @@ namespace BoundingBoxes {
         }
 
         public bool Update(string path) {
-            byte[] pathBytes = Encoding.UTF8.GetBytes(path + "\0");
-            fixed (byte* p = pathBytes) {
-                return UpdateDB(_nativeDb, p);
+            var utf8ByteCount = Encoding.UTF8.GetByteCount(path);
+            Span<byte> buffer = stackalloc byte[utf8ByteCount + 1];
+            Encoding.UTF8.GetBytes(path, buffer);
+            buffer[utf8ByteCount] = 0;
+            fixed (byte* p = buffer) { return UpdateDB(_nativeDb, p); }
+        }
+
+        public void BatchGetRaw(
+            ReadOnlySpan<byte> flatKeys, 
+            ReadOnlySpan<int> keyOffsets, 
+            ReadOnlySpan<int> keyLengths, 
+            int count,
+            int[] outOffsets,
+            int[] outLengths,
+            byte[] outFound,
+            Action<IntPtr, int[], int[], byte[], int> resultHandler) {
+            
+            byte* pResultBlock = null;
+            fixed (byte* pFlatKeys = flatKeys)
+            fixed (int* pKeyOffsets = keyOffsets)
+            fixed (int* pKeyLengths = keyLengths)
+            fixed (int* pOutOffsets = outOffsets)
+            fixed (int* pOutLengths = outLengths)
+            fixed (byte* pOutFound = outFound) {
+                BatchGetFlat(_nativeDb, pFlatKeys, pKeyOffsets, pKeyLengths, count, out pResultBlock, pOutOffsets, pOutLengths, pOutFound);
+                if (pResultBlock != null) {
+                    resultHandler((nint)pResultBlock, outOffsets, outLengths, outFound, count);
+                    FreeBuffer(pResultBlock);
+                }
             }
         }
-        #endregion
-
-        #region Log Session Wrapper
 
         public class LogSession : IDisposable {
             private IntPtr _sessionPtr;
             public IntPtr NativeHandle => _sessionPtr;
 
             public LogSession(string dbPath) {
-                byte[] pathBytes = Encoding.UTF8.GetBytes(dbPath + "\0");
-                fixed (byte* p = pathBytes) {
-                    _sessionPtr = OpenLogSession(p);
-                }
+                var utf8ByteCount = Encoding.UTF8.GetByteCount(dbPath);
+                Span<byte> buffer = stackalloc byte[utf8ByteCount + 1];
+                Encoding.UTF8.GetBytes(dbPath, buffer);
+                buffer[utf8ByteCount] = 0;
+                fixed (byte* p = buffer) { _sessionPtr = OpenLogSession(p); }
             }
 
             public bool Update(string logDir) {
                 if (_sessionPtr == IntPtr.Zero) return false;
-                byte[] pathBytes = Encoding.UTF8.GetBytes(logDir + "\0");
-                fixed (byte* p = pathBytes) {
-                    return UpdateLogSession(_sessionPtr, p);
+                var utf8ByteCount = Encoding.UTF8.GetByteCount(logDir);
+                Span<byte> buffer = stackalloc byte[utf8ByteCount + 1];
+                Encoding.UTF8.GetBytes(logDir, buffer);
+                buffer[utf8ByteCount] = 0;
+                fixed (byte* p = buffer) { return UpdateLogSession(_sessionPtr, p); }
+            }
+
+            public void BatchGetRaw(
+                ReadOnlySpan<byte> flatKeys,
+                ReadOnlySpan<int> keyOffsets,
+                ReadOnlySpan<int> keyLengths,
+                int count,
+                int[] outOffsets,
+                int[] outLengths,
+                byte[] outFound,
+                Action<IntPtr, int[], int[], byte[], int> resultHandler) {
+
+                byte* pResultBlock = null;
+                fixed (byte* pFlatKeys = flatKeys)
+                fixed (int* pKeyOffsets = keyOffsets)
+                fixed (int* pKeyLengths = keyLengths)
+                fixed (int* pOutOffsets = outOffsets)
+                fixed (int* pOutLengths = outLengths)
+                fixed (byte* pOutFound = outFound) {
+                    BatchGetSessionFlat(_sessionPtr, pFlatKeys, pKeyOffsets, pKeyLengths, count, out pResultBlock, pOutOffsets, pOutLengths, pOutFound);
+                    if (pResultBlock != null) {
+                        resultHandler((nint)pResultBlock, outOffsets, outLengths, outFound, count);
+                        FreeBuffer(pResultBlock);
+                    }
                 }
             }
 
@@ -143,6 +188,5 @@ namespace BoundingBoxes {
                 GC.SuppressFinalize(this);
             }
         }
-        #endregion
     }
 }

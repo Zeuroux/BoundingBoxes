@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace BoundingBoxes {
     internal static unsafe class Parser {
-
+        [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
         public static void ParseInto(ReadOnlySpan<byte> data, List<CachedRenderBox> smallDest, List<BoundingBox> largeDest) {
             if (data.Length < 4) return;
 
@@ -11,64 +11,49 @@ namespace BoundingBoxes {
                 byte* ptr = pinnedData;
                 byte* end = pinnedData + data.Length;
 
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                static bool TryReadI32(ref byte* p, byte* e, out int value) {
-                    if (p + 4 > e) { value = default; return false; }
-                    value = Unsafe.ReadUnaligned<int>(p);
-                    p += 4;
-                    return true;
-                }
+                int version = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                if (ptr > end) return;
 
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                static bool TryReadU32(ref byte* p, byte* e, out uint value) {
-                    if (p + 4 > e) { value = default; return false; }
-                    value = Unsafe.ReadUnaligned<uint>(p);
-                    p += 4;
-                    return true;
-                }
+                int structCount = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                if (ptr > end) return;
 
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                static bool TryReadU16(ref byte* p, byte* e, out ushort value) {
-                    if (p + 2 > e) { value = default; return false; }
-                    value = Unsafe.ReadUnaligned<ushort>(p);
-                    p += 2;
-                    return true;
-                }
-
-                if (!TryReadI32(ref ptr, end, out int version)) return;
-
-                if (!TryReadI32(ref ptr, end, out int structCount)) return;
                 for (int i = 0; i < structCount; i++) {
-                    if (!TryReadU32(ref ptr, end, out _)) return;
-                    if (!TryReadU16(ref ptr, end, out ushort strLen)) return;
+                    if (ptr + 6 > end) return;
+                    ptr += 4;
+                    ushort strLen = Unsafe.ReadUnaligned<ushort>(ptr); ptr += 2;
                     ptr += strLen;
-                    if (ptr > end) return;
                 }
+                if (ptr > end) return;
 
-                if (!TryReadI32(ref ptr, end, out int aabbCount)) return;
-                if (aabbCount > 50) {
-                    Console.WriteLine(aabbCount);
-                    return;
-                }
-                var tempAABBs = new BoundingBox[aabbCount];
+                int aabbCount = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                if (ptr > end) return;
+                if (aabbCount > 50) return;
+
+                BoundingBox* tempAABBs = stackalloc BoundingBox[aabbCount];
+                uint* seenIds = stackalloc uint[aabbCount];
                 int aabbActualCount = 0;
-                var aabbSeen = new HashSet<uint>(aabbCount > 0 ? aabbCount : 0);
 
                 for (int i = 0; i < aabbCount; i++) {
-                    if (!TryReadU32(ref ptr, end, out uint id)) return;
+                    if (ptr + 28 > end) return;
+                    uint id = Unsafe.ReadUnaligned<uint>(ptr); ptr += 4;
 
-                    if (!aabbSeen.Add(id)) {
-                        ptr += 24;
-                        if (ptr > end) return;
-                        continue;
+                    bool exists = false;
+                    for (int k = 0; k < aabbActualCount; k++) {
+                        if (seenIds[k] == id) { exists = true; break; }
                     }
 
-                    if (!TryReadI32(ref ptr, end, out int xmin)) return;
-                    if (!TryReadI32(ref ptr, end, out int ymin)) return;
-                    if (!TryReadI32(ref ptr, end, out int zmin)) return;
-                    if (!TryReadI32(ref ptr, end, out int xmax)) return;
-                    if (!TryReadI32(ref ptr, end, out int ymax)) return;
-                    if (!TryReadI32(ref ptr, end, out int zmax)) return;
+                    if (exists) {
+                        ptr += 24;
+                        continue;
+                    }
+                    seenIds[aabbActualCount] = id;
+
+                    int xmin = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                    int ymin = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                    int zmin = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                    int xmax = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                    int ymax = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                    int zmax = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
 
                     tempAABBs[aabbActualCount++] = new BoundingBox(
                         new Vec3(xmin, ymin, zmin),
@@ -76,24 +61,32 @@ namespace BoundingBoxes {
                     );
                 }
 
-                if (!TryReadI32(ref ptr, end, out int dynCount)) return;
-                for (int i = 0; i < dynCount; i++) {
-                    if (!TryReadU32(ref ptr, end, out _)) return;
-                    ptr += 8;
-                    if (ptr > end) return;
-                }
+                int dynCount = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                if (ptr > end) return;
+                int dynSkip = dynCount * 8 + dynCount * 4;
+                ptr += dynSkip;
+                if (ptr > end) return;
 
-                if (!TryReadI32(ref ptr, end, out int statCount)) return;
-                var statSeen = new HashSet<uint>(statCount > 0 ? statCount : 0);
+                int statCount = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+                if (ptr > end) return;
 
+                uint* statSeen = stackalloc uint[statCount > 50 ? 50 : statCount];
+                int statSeenCount = 0;
                 int currentAabbIndex = 0;
-                for (int i = 0; i < statCount; i++) {
-                    if (!TryReadU32(ref ptr, end, out uint id)) return;
-                    if (!TryReadU32(ref ptr, end, out _)) return;
-                    if (!TryReadI32(ref ptr, end, out _)) return;
-                    if (!TryReadI32(ref ptr, end, out int full)) return;
 
-                    if (!statSeen.Add(id)) continue;
+                for (int i = 0; i < statCount; i++) {
+                    if (ptr + 16 > end) return;
+                    uint id = Unsafe.ReadUnaligned<uint>(ptr); ptr += 4;
+                    ptr += 4;
+                    ptr += 4;
+                    int full = Unsafe.ReadUnaligned<int>(ptr); ptr += 4;
+
+                    bool exists = false;
+                    for (int k = 0; k < statSeenCount; k++) {
+                        if (statSeen[k] == id) { exists = true; break; }
+                    }
+                    if (exists) continue;
+                    if (statSeenCount < 50) statSeen[statSeenCount++] = id;
 
                     if (currentAabbIndex < aabbActualCount) {
                         var box = tempAABBs[currentAabbIndex];

@@ -12,17 +12,15 @@ namespace BoundingBoxes {
         public readonly Vec3 LineStart;
         public readonly Vec3 LineEnd;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public CachedRenderBox(BoundingBox box) {
             MainBox = new BoundingBox(box.Minimum, box.Maximum + 1);
-
             var size = box.Maximum - box.Minimum;
             var center = box.Minimum + size / 2;
-
             var renderPos = center;
             if (size.X % 2 != 0) renderPos.X += 0.5f;
             if (size.Z % 2 != 0) renderPos.Z += 0.5f;
             renderPos.Y = box.Minimum.Y;
-
             CenterBox = new BoundingBox(renderPos, new Vec3(renderPos.X + 1, box.Maximum.Y + 1, renderPos.Z + 1));
             LineStart = CenterBox.Minimum;
             LineEnd = new Vec3(renderPos.X, box.Maximum.Y, renderPos.Z);
@@ -46,7 +44,6 @@ namespace BoundingBoxes {
 
         private struct PlayerChunkInfo {
             public int X, Z, Dimension;
-            public readonly bool Equals(PlayerChunkInfo other) => X == other.X && Z == other.Z && Dimension == other.Dimension;
         }
 
         private PlayerChunkInfo lastPlayerChunk;
@@ -63,9 +60,7 @@ namespace BoundingBoxes {
             try {
                 db = new LevelDBMinimal(srcPath);
                 dbls = new LevelDBMinimal.LogSession(srcPath);
-            } catch (Exception ex) {
-                Console.WriteLine($"Failed to init LevelDB: {ex.Message}");
-            }
+            } catch { }
         }
 
         protected override void OnEnabled() {
@@ -74,8 +69,7 @@ namespace BoundingBoxes {
             cts = new();
             workerThread = new Thread(() => BackgroundWorker(cts.Token)) {
                 IsBackground = true,
-                Name = "BoundingBoxLoader",
-                Priority = ThreadPriority.Normal
+                Priority = ThreadPriority.Highest 
             };
             workerThread.Start();
         }
@@ -90,7 +84,6 @@ namespace BoundingBoxes {
                 workerThread = null;
             }
         }
-
         protected override void OnUnloaded() {
             OnDisabled();
             db?.Dispose();
@@ -100,14 +93,16 @@ namespace BoundingBoxes {
             Onix.Events.Common.WorldRender -= OnWorldRender;
             Onix.Events.Common.Tick -= OnTick;
         }
+        int counter = 0;
         private void OnTick() {
+            counter++;
+            if (counter % 10 != 0) return;
             if (Onix.LocalPlayer is not LocalPlayer lp) return;
-            var currentChunk = new PlayerChunkInfo {
-                X = lp.ChunkPosition.X,
-                Z = lp.ChunkPosition.Y,
-                Dimension = (int)lp.Dimension.Id
-            };
-            lastPlayerChunk = currentChunk;
+            int cx = lp.ChunkPosition.X;
+            int cz = lp.ChunkPosition.Y;
+            int dim = (int)lp.Dimension.Id;
+            
+            lastPlayerChunk = new PlayerChunkInfo { X = cx, Z = cz, Dimension = dim };
             needsUpdate = true;
             updateSignal.Set();
         }
@@ -116,22 +111,26 @@ namespace BoundingBoxes {
             var tempBoxes = new List<CachedRenderBox>(256);
             var tempLargeBoxes = new List<BoundingBox>(64);
             const int radius = 4;
-
-            byte* keyBuf = stackalloc byte[16];
+            const int diameter = (radius * 2) + 1;
+            const int area = diameter * diameter;
+            
+            const int maxKeySize = 13; 
+            byte[] keysBuffer = new byte[area * maxKeySize];
+            int[] keyOffsets = new int[area];
+            int[] keyLengths = new int[area];
+            
+            int[] outOffsets = new int[area];
+            int[] outLengths = new int[area];
+            byte[] outFound = new byte[area];
 
             while (!token.IsCancellationRequested) {
                 try {
                     updateSignal.Wait(token);
                     updateSignal.Reset();
-
                     if (!needsUpdate) continue;
                     needsUpdate = false;
 
                     if (db is null || dbls is null) continue;
-
-                    IntPtr dbHandle = db.NativeHandle;
-                    IntPtr logHandle = dbls.NativeHandle;
-
                     db.Update(srcPath);
                     dbls.Update(srcPath);
 
@@ -139,59 +138,81 @@ namespace BoundingBoxes {
                     tempLargeBoxes.Clear();
 
                     var chunkInfo = lastPlayerChunk;
+                    int keyCount = 0;
+                    int currentKeyOffset = 0;
 
-                    for (int dx = -radius; dx <= radius; dx++) {
-                        for (int dz = -radius; dz <= radius; dz++) {
-                            if (token.IsCancellationRequested) return;
-
-                            int keyLen = WriteChunkKey(keyBuf, chunkInfo.X + dx, chunkInfo.Z + dz, chunkInfo.Dimension);
-
-                            if (LevelDBMinimal.GetValue(dbHandle, keyBuf, (UIntPtr)keyLen, out byte* valPtr, out nuint valLen)) {
-                                var dataSpan = new ReadOnlySpan<byte>(valPtr, (int)valLen);
-                                Parser.ParseInto(dataSpan, tempBoxes, tempLargeBoxes);
-                                LevelDBMinimal.FreeBuffer(valPtr);
-                            } else if (LevelDBMinimal.GetValueFromSession(logHandle, keyBuf, (UIntPtr)keyLen, out valPtr, out valLen)) {
-                                var dataSpan = new ReadOnlySpan<byte>(valPtr, (int)valLen);
-                                Parser.ParseInto(dataSpan, tempBoxes, tempLargeBoxes);
-                                LevelDBMinimal.FreeBuffer(valPtr);
+                    fixed (byte* pBase = keysBuffer) {
+                        for (int dx = -radius; dx <= radius; dx++) {
+                            for (int dz = -radius; dz <= radius; dz++) {
+                                int x = chunkInfo.X + dx;
+                                int z = chunkInfo.Z + dz;
+                                int dim = chunkInfo.Dimension;
+                                
+                                int kLen = (dim != 0) ? 13 : 9;
+                                byte* ptr = pBase + currentKeyOffset;
+                                
+                                Unsafe.WriteUnaligned(ptr, x);
+                                Unsafe.WriteUnaligned(ptr + 4, z);
+                                int offset = 8;
+                                if (dim != 0) {
+                                    Unsafe.WriteUnaligned(ptr + offset, dim);
+                                    offset += 4;
+                                }
+                                *(ptr + offset) = 0x77;
+                                
+                                keyOffsets[keyCount] = currentKeyOffset;
+                                keyLengths[keyCount] = kLen;
+                                currentKeyOffset += kLen;
+                                keyCount++;
                             }
                         }
+                    }
+
+                    if (token.IsCancellationRequested) break;
+
+                    static void HandleBatch(nint ptr, int[] oOff, int[] oLen, byte[] found, int cnt, List<CachedRenderBox> boxes, List<BoundingBox> largeBoxes) {
+                        for (int i = 0; i < cnt; i++) {
+                            if (found[i] != 0 && oLen[i] > 0) {
+                                Parser.ParseInto(new ReadOnlySpan<byte>((byte*)ptr + oOff[i], oLen[i]), boxes, largeBoxes);
+                            }
+                        }
+                    }
+
+                    db.BatchGetRaw(keysBuffer, keyOffsets, keyLengths, keyCount, outOffsets, outLengths, outFound,
+                        (ptr, oOff, oLen, found, cnt) => HandleBatch(ptr, oOff, oLen, found, cnt, tempBoxes, tempLargeBoxes));
+
+                    bool hasMissing = false;
+                    for (int i = 0; i < keyCount; i++) if (outFound[i] == 0) { hasMissing = true; break; }
+
+                    if (hasMissing) {
+                        dbls.BatchGetRaw(keysBuffer, keyOffsets, keyLengths, keyCount, outOffsets, outLengths, outFound,
+                            (ptr, oOff, oLen, found, cnt) => HandleBatch(ptr, oOff, oLen, found, cnt, tempBoxes, tempLargeBoxes));
                     }
 
                     renderCache = [.. tempBoxes];
                     largeBoxes = [.. tempLargeBoxes];
                 } catch (OperationCanceledException) {
                     break;
-                }
+                } catch { }
             }
         }
 
         private void OnWorldRender(RendererWorld gfx, float delta) {
             var currentCache = renderCache;
             var currentLarge = largeBoxes;
-
-            foreach (var box in currentLarge) {
+            int cCount = currentCache.Length;
+            int lCount = currentLarge.Length;
+            
+            for (int i = 0; i < lCount; i++) {
+                var box = currentLarge[i];
                 gfx.RenderBoundingBoxOutline(new BoundingBox(box.Minimum, box.Maximum + 1), ColorF.Red);
             }
-            foreach (var item in currentCache) {
+            for (int i = 0; i < cCount; i++) {
+                ref var item = ref currentCache[i];
                 gfx.RenderBoundingBoxOutline(item.MainBox, ColorF.Aqua);
                 gfx.DrawLine(item.LineStart, item.LineEnd, ColorF.Red);
                 gfx.RenderBoundingBoxOutline(item.CenterBox, ColorF.White);
             }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int WriteChunkKey(byte* ptr, int x, int z, int dimension) {
-            Unsafe.WriteUnaligned(ptr, x);
-            Unsafe.WriteUnaligned(ptr + 4, z);
-
-            int offset = 8;
-            if (dimension != 0) {
-                Unsafe.WriteUnaligned(ptr + offset, dimension);
-                offset += 4;
-            }
-            *(ptr + offset) = 0x77;
-            return offset + 1;
         }
     }
 }

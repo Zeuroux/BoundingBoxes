@@ -47,7 +47,7 @@
 	</ItemGroup>
 
 	<Target Name="BuildLevelDBMinimal" BeforeTargets="PostBuildEvent">
-		<Exec Condition="!Exists('$(IntermediateOutputPath)_native\CMakeCache.txt')" Command="cmake -S &quot;$(SolutionDir)LevelDBMinimal&quot; -B &quot;$(IntermediateOutputPath)_native&quot; -A x64" />
+		<Exec Condition="!Exists('$(IntermediateOutputPath)_native\CMakeCache.txt')" Command="cmake -S &quot;$(SolutionDir)LevelDBMinimal\src&quot; -B &quot;$(IntermediateOutputPath)_native&quot; -A x64" />
 		<Exec Command="cmake --build &quot;$(IntermediateOutputPath)_native&quot; --config $(Configuration)" />
 		<Exec Command="xcopy /Y /D /C &quot;$(IntermediateOutputPath)_native\$(Configuration)\LevelDBMinimal.dll&quot; &quot;$(OutDir)LevelDBMinimal\&quot;" />
 	</Target>
