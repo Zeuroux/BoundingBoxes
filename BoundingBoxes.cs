@@ -4,6 +4,7 @@ using OnixRuntime.Api.Maths;
 using OnixRuntime.Api.Rendering;
 using OnixRuntime.Plugin;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace BoundingBoxes {
     internal readonly struct CachedRenderBox {
@@ -47,7 +48,7 @@ namespace BoundingBoxes {
         }
 
         private PlayerChunkInfo lastPlayerChunk;
-        private const string srcPath = @"C:\Users\Zeyro\AppData\Roaming\Minecraft Bedrock\Users\14394695988390012034\games\com.mojang\minecraftWorlds\nYGbgsdjPN4=\db";
+        private const string srcPath = @"C:\Users\Zeyro\AppData\Roaming\Minecraft Bedrock\Users\14394695988390012034\games\com.mojang\minecraftWorlds\rOawr6mqbUc=\db";
 
         public BoundingBoxes(OnixPluginInitInfo initInfo) : base(initInfo) {
             Instance = this;
@@ -57,7 +58,7 @@ namespace BoundingBoxes {
             Config = new BoundingBoxesConfig(PluginDisplayModule, true);
             Onix.Events.Common.WorldRender += OnWorldRender;
             Onix.Events.Common.Tick += OnTick;
-            try {
+            try {    
                 db = new LevelDBMinimal(srcPath);
                 dbls = new LevelDBMinimal.LogSession(srcPath);
             } catch { }
@@ -110,7 +111,7 @@ namespace BoundingBoxes {
         private void BackgroundWorker(CancellationToken token) {
             var tempBoxes = new List<CachedRenderBox>(256);
             var tempLargeBoxes = new List<BoundingBox>(64);
-            const int radius = 4;
+            const int radius = 7;
             const int diameter = (radius * 2) + 1;
             const int area = diameter * diameter;
             
@@ -173,7 +174,7 @@ namespace BoundingBoxes {
                     static void HandleBatch(nint ptr, int[] oOff, int[] oLen, byte[] found, int cnt, List<CachedRenderBox> boxes, List<BoundingBox> largeBoxes) {
                         for (int i = 0; i < cnt; i++) {
                             if (found[i] != 0 && oLen[i] > 0) {
-                                Parser.ParseInto(new ReadOnlySpan<byte>((byte*)ptr + oOff[i], oLen[i]), boxes, largeBoxes);
+                                Parser.ParseAABBVolumes(new ReadOnlySpan<byte>((byte*)ptr + oOff[i], oLen[i]), boxes, largeBoxes);
                             }
                         }
                     }
@@ -188,7 +189,9 @@ namespace BoundingBoxes {
                         dbls.BatchGetRaw(keysBuffer, keyOffsets, keyLengths, keyCount, outOffsets, outLengths, outFound,
                             (ptr, oOff, oLen, found, cnt) => HandleBatch(ptr, oOff, oLen, found, cnt, tempBoxes, tempLargeBoxes));
                     }
-
+                    db.Iterate("VILLAGE", "INFO", (keySpan, valSpan) => {
+                        Parser.ParseVillageInfo(valSpan, tempLargeBoxes);
+                    });
                     renderCache = [.. tempBoxes];
                     largeBoxes = [.. tempLargeBoxes];
                 } catch (OperationCanceledException) {
@@ -196,6 +199,7 @@ namespace BoundingBoxes {
                 } catch { }
             }
         }
+
 
         private void OnWorldRender(RendererWorld gfx, float delta) {
             var currentCache = renderCache;

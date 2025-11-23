@@ -10,6 +10,9 @@ namespace BoundingBoxes {
         private IntPtr _nativeDb;
         private const string Dll = "LevelDBMinimal/LevelDBMinimal";
 
+        // Custom delegate to support ReadOnlySpan<byte> (ref structs cannot be used in Action<T>)
+        public delegate void DBKeyValueDelegate(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value);
+
         [LibraryImport("kernel32", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
         private static partial IntPtr LoadLibraryW(string lpFileName);
 
@@ -50,6 +53,19 @@ namespace BoundingBoxes {
             int* outDataOffsets,
             int* outDataLengths,
             byte* outFound
+        );
+
+        // Delegate for iteration callback from Native C++
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void IterateCallback(byte* key, int keyLen, byte* val, int valLen);
+
+        [LibraryImport(Dll)]
+        [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvCdecl) })]
+        private static partial void IterateDB(
+            IntPtr db,
+            byte* prefix, int prefixLen,
+            byte* suffix, int suffixLen,
+            IterateCallback callback
         );
 
         [LibraryImport(Dll)]
@@ -109,16 +125,50 @@ namespace BoundingBoxes {
             fixed (byte* p = buffer) { return UpdateDB(_nativeDb, p); }
         }
 
+        // Updated to use DBKeyValueDelegate instead of Action<...>
+        public void Iterate(string? prefix, string? suffix, DBKeyValueDelegate handler) {
+            if (_nativeDb == IntPtr.Zero) return;
+
+            // Marshal prefix
+            byte[]? prefixBytes = null;
+            int prefixLen = 0;
+            if (!string.IsNullOrEmpty(prefix)) {
+                prefixBytes = Encoding.UTF8.GetBytes(prefix);
+                prefixLen = prefixBytes.Length;
+            }
+
+            // Marshal suffix
+            byte[]? suffixBytes = null;
+            int suffixLen = 0;
+            if (!string.IsNullOrEmpty(suffix)) {
+                suffixBytes = Encoding.UTF8.GetBytes(suffix);
+                suffixLen = suffixBytes.Length;
+            }
+
+            // Keep delegate alive
+            IterateCallback cb = (kPtr, kLen, vPtr, vLen) => {
+                handler(new ReadOnlySpan<byte>(kPtr, kLen), new ReadOnlySpan<byte>(vPtr, vLen));
+            };
+
+            fixed (byte* pPrefix = prefixBytes)
+            fixed (byte* pSuffix = suffixBytes) {
+                IterateDB(_nativeDb, pPrefix, prefixLen, pSuffix, suffixLen, cb);
+            }
+
+            // GC.KeepAlive to prevent delegate from being collected while native code runs
+            GC.KeepAlive(cb);
+        }
+
         public void BatchGetRaw(
-            ReadOnlySpan<byte> flatKeys, 
-            ReadOnlySpan<int> keyOffsets, 
-            ReadOnlySpan<int> keyLengths, 
+            ReadOnlySpan<byte> flatKeys,
+            ReadOnlySpan<int> keyOffsets,
+            ReadOnlySpan<int> keyLengths,
             int count,
             int[] outOffsets,
             int[] outLengths,
             byte[] outFound,
             Action<IntPtr, int[], int[], byte[], int> resultHandler) {
-            
+
             byte* pResultBlock = null;
             fixed (byte* pFlatKeys = flatKeys)
             fixed (int* pKeyOffsets = keyOffsets)

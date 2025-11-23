@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <future> 
 #include <atomic>
+#include <queue>
 
 #include "leveldb/table.h"
 #include "leveldb/env.h"
@@ -133,7 +134,6 @@ static bool RemapLogIfNeeded(MappedLog* log) {
     log->mappedSize = currentOnDiskSize; return true;
 }
 
-// Thread-local iterator cache to avoid reallocation
 struct IteratorCache {
     std::vector<leveldb::Iterator*> iterators;
     ~IteratorCache() { for (auto* it : iterators) delete it; }
@@ -202,7 +202,6 @@ static bool InternalGetFromSessionToBuffer(LogSession* session, const uint8_t* k
                 const uint8_t* h = p - 1;
                 bool validEntry = false;
 
-                // Optimized reverse varint scan
                 while (h >= lookbackStart) {
                     size_t consumed = 0;
                     uint32_t kLen = ReadVarint32(h, consumed);
@@ -228,6 +227,49 @@ static bool InternalGetFromSessionToBuffer(LogSession* session, const uint8_t* k
     }
     return false;
 }
+
+// Iteration Support Structures
+typedef void (*DBIterateCallback)(const uint8_t* key, int32_t keyLen, const uint8_t* val, int32_t valLen);
+
+struct IterWrapper {
+    leveldb::Iterator* iter;
+    size_t tableIndex; // Lower index = Newer table (Higher priority)
+    std::string_view userKey;
+
+    IterWrapper(leveldb::Iterator* it, size_t idx) : iter(it), tableIndex(idx) {
+        Update();
+    }
+
+    void Update() {
+        if (iter && iter->Valid()) {
+            leveldb::Slice k = iter->key();
+            // Internal keys have 8 bytes trailer (SeqNum + Type)
+            if (k.size() >= 8) {
+                userKey = std::string_view(k.data(), k.size() - 8);
+            }
+            else {
+                userKey = std::string_view(k.data(), k.size());
+            }
+        }
+        else {
+            userKey = {};
+        }
+    }
+};
+
+struct IterCompare {
+    bool operator()(const IterWrapper* a, const IterWrapper* b) {
+        // Min-Heap logic: Return true if a > b.
+        // We want smallest user key first.
+        int cmp = a->userKey.compare(b->userKey);
+        if (cmp != 0) return cmp > 0;
+
+        // If keys are equal, we want the NEWER table (Smaller Index) to come first.
+        // In Min-Heap, "Smaller" pops first.
+        // So if IndexA > IndexB, A is "Larger" (worse), so return true.
+        return a->tableIndex > b->tableIndex;
+    }
+};
 
 extern "C" {
     EXPORT BedrockDB* OpenDB(const char* path) {
@@ -291,7 +333,6 @@ extern "C" {
                 [](auto const& a, auto const& b) { return a->path > b->path; });
             db->pathIndex.clear();
             for (size_t i = 0; i < db->tables.size(); ++i) db->pathIndex.emplace(db->tables[i]->path, i);
-            // Clear thread local cache implicitly by invalidation or just let it rebuild next time
         }
         return changed;
     }
@@ -300,6 +341,122 @@ extern "C" {
         if (!db) return;
         for (auto& t : db->tables) { if (t) { delete t->table; delete t->file; } }
         delete db;
+    }
+
+    EXPORT void IterateDB(
+        BedrockDB* db,
+        const uint8_t* prefix, int32_t prefixLen,
+        const uint8_t* suffix, int32_t suffixLen,
+        DBIterateCallback callback
+    ) {
+        if (!db || !callback) return;
+
+        // 1. Create iterators for all tables
+        std::vector<std::unique_ptr<leveldb::Iterator>> ownerVec;
+        std::vector<IterWrapper> wrappers;
+        ownerVec.reserve(db->tables.size());
+        wrappers.reserve(db->tables.size());
+
+        // Create separate iterators to avoid messing with the thread-local cache
+        for (size_t i = 0; i < db->tables.size(); ++i) {
+            auto* it = db->tables[i]->table->NewIterator(db->readOptions);
+            ownerVec.emplace_back(it);
+
+            if (prefix && prefixLen > 0) {
+                leveldb::Slice p((const char*)prefix, prefixLen);
+                it->Seek(p);
+            }
+            else {
+                it->SeekToFirst();
+            }
+
+            if (it->Valid()) {
+                wrappers.emplace_back(it, i);
+            }
+        }
+
+        // 2. Priority Queue for Merging
+        std::priority_queue<IterWrapper*, std::vector<IterWrapper*>, IterCompare> pq;
+        for (auto& w : wrappers) {
+            if (w.iter->Valid()) pq.push(&w);
+        }
+
+        std::string lastUserKey;
+        bool first = true;
+
+        std::string_view prefixView;
+        if (prefix && prefixLen > 0) prefixView = std::string_view((const char*)prefix, prefixLen);
+
+        std::string_view suffixView;
+        if (suffix && suffixLen > 0) suffixView = std::string_view((const char*)suffix, suffixLen);
+
+        while (!pq.empty()) {
+            IterWrapper* top = pq.top();
+            pq.pop();
+
+            // 3. Process Key
+            std::string_view currentKey = top->userKey;
+
+            // Check Prefix (optimization: if sorted key doesn't start with prefix, we are done)
+            if (!prefixView.empty()) {
+                if (currentKey.size() < prefixView.size() ||
+                    currentKey.substr(0, prefixView.size()) != prefixView) {
+                    // Since keys are sorted, any subsequent key will also not match
+                    break;
+                }
+            }
+
+            // Check Duplicates (Shadowing)
+            // Since tables are sorted by age (index 0 = newest), the first time we see a key, it is the newest version.
+            bool isNewKey = first || currentKey != lastUserKey;
+
+            if (isNewKey) {
+                first = false;
+                lastUserKey = std::string(currentKey);
+
+                // Check Type (last byte of internal key usually)
+                // We need to look at the internal key to see if it's a deletion.
+                // Internal Key: [User Key][Trailer(8b)]
+                // Trailer is (Seq << 8) | Type
+                // In Little Endian (EncodeFixed64), the first byte of the trailer is the Type.
+                leveldb::Slice raw = top->iter->key();
+                uint8_t type = 0;
+
+                if (raw.size() >= 8) {
+                    // Get the byte at offset (size - 8)
+                    type = (uint8_t)raw.data()[raw.size() - 8];
+                }
+
+                // kTypeDeletion = 0x0, kTypeValue = 0x1
+                // If type is 0 (Deletion), we skip callback (it's deleted).
+
+                if (type == 0x1) {
+                    // Check Suffix
+                    bool suffixMatch = true;
+                    if (!suffixView.empty()) {
+                        if (currentKey.size() < suffixView.size() ||
+                            currentKey.substr(currentKey.size() - suffixView.size()) != suffixView) {
+                            suffixMatch = false;
+                        }
+                    }
+
+                    if (suffixMatch) {
+                        leveldb::Slice v = top->iter->value();
+                        callback(
+                            (const uint8_t*)currentKey.data(), (int32_t)currentKey.size(),
+                            (const uint8_t*)v.data(), (int32_t)v.size()
+                        );
+                    }
+                }
+            }
+
+            // 4. Advance Iterator
+            top->iter->Next();
+            top->Update();
+            if (top->iter->Valid()) {
+                pq.push(top);
+            }
+        }
     }
 
     struct TempResult {
